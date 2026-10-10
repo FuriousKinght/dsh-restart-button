@@ -5,6 +5,12 @@ itself, comes back, and the page reconnects on its own. No more closing the wind
 by hand and double-clicking the icon again.
 
 - **Platform:** Windows desktop only.
+- **Requires DSH `0.2.0-rc.2` or newer.** Older builds have no
+  `sidebar.footer.action` slot for the button to mount into. The requirement is
+  declared in `package.json` as `peerDependencies` on
+  `@deepseek-ai/dsh-host-webserver` and `@deepseek-ai/dsh-client-ui-slots`, which
+  DSH checks before importing a plugin — so an older build refuses the install
+  with a named reason instead of mounting a button that never draws.
 - **Applies to:** the packaged desktop app. It refuses to run under `dsh web` in a
   terminal, where killing the parent process would kill your shell.
 - **Cost of a restart:** it is a force-kill (`taskkill /T /F`), so a task that is
@@ -12,6 +18,25 @@ by hand and double-clicking the icon again.
   first arms it for 5 seconds, the second confirms.
 - **Nothing to configure:** the plugin declares no settings namespace and has no
   dependencies outside the Node standard library.
+
+### Version requirement
+
+The range is `^0.2.0-rc.2`, which resolves to `>=0.2.0-rc.2 <0.3.0`. DSH evaluates
+it as `semver.satisfies(runtimeVersion, range, { includePrerelease: true })` against
+the harness's own version, and refuses the install when it does not match. That
+call was reproduced against a real `semver` for the cases that matter:
+
+| Harness version | Installs | |
+| --- | --- | --- |
+| `0.1.7-rc.2` | ❌ | no footer slot in that build |
+| `0.2.0-rc.1` | ❌ | the release just before the one this was built against |
+| `0.2.0-rc.2` | ✅ | the version this plugin was developed and tested on |
+| `0.2.0-rc.3`, `0.2.0`, `0.2.1` | ✅ | later prereleases and patches of the same minor |
+| `0.3.0` | ❌ | outside the `^` upper bound, so a new minor needs a re-check |
+
+A refusal is not a crash: it is one line naming the plugin, the version and the
+peer that did not match, and `dsh plugin allow-version` exists to override it
+deliberately.
 
 ### Source layout
 
@@ -156,6 +181,9 @@ node verify/verify-relaunch.mjs    # 助手的"活过自己杀的那棵树"—�
 
 ## 已知边界
 
+- **需要 DSH `0.2.0-rc.2` 或更新的版本。** 更早的构建里没有 `sidebar.footer.action` 这个槽位，按钮没有地方挂。这个要求在 `package.json` 里以 `peerDependencies` 声明（`@deepseek-ai/dsh-host-webserver`、`@deepseek-ai/dsh-client-ui-slots`），DSH 在导入插件前会核对——所以旧版本会**明确拒绝安装并给出原因**，而不是装上一个画不出来的按钮。
+
+  范围写的是 `^0.2.0-rc.2`（即 `>=0.2.0-rc.2 <0.3.0`），DSH 用 `semver.satisfies(运行时版本, 范围, { includePrerelease: true })` 判定。实测结果：`0.2.0-rc.1` **装不上**，`0.2.0-rc.2` 正常，后续的 `0.2.0-rc.3` / `0.2.0` / `0.2.1` 都可以，`0.3.0` 会因上界被挡下（新的次版本需要重新确认）。被挡下不是崩溃：只会有一行说明是哪个插件、哪个版本、哪个 peer 不匹配；确实想装可以用 `dsh plugin allow-version` 显式豁免。
 - **只支持 Windows 桌面版。** 判断依据是 Host 与 Electron 之间有没有 IPC 通道（`process.connected`）。命令行跑的 `dsh web` 没有这条通道，按钮会拒绝执行并说明原因——在那里"杀掉父进程"等于杀掉你的终端。
 - **重启会中断正在跑的任务。** 这是强杀，没有优雅退出：所以按钮要点两下，第二下才是真的。
 - **第一次装完需要手动重启一次 DSH。** 补丁层会热加载，但**运行中的进程持有旧的 `entry.js`**——Node 的 ESM 缓存不带 cache-busting，重新挂载同一个包名拿到的还是旧模块。这一次之后按钮才真正生效。
