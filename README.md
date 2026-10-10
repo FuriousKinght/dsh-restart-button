@@ -5,12 +5,13 @@ itself, comes back, and the page reconnects on its own. No more closing the wind
 by hand and double-clicking the icon again.
 
 - **Platform:** Windows desktop only.
-- **Requires DSH `0.2.0-rc.2` or newer.** Older builds have no
-  `sidebar.footer.action` slot for the button to mount into. The requirement is
-  declared in `package.json` as `peerDependencies` on
-  `@deepseek-ai/dsh-host-webserver` and `@deepseek-ai/dsh-client-ui-slots`, which
-  DSH checks before importing a plugin — so an older build refuses the install
-  with a named reason instead of mounting a button that never draws.
+- **Requires DSH `0.2.0-rc.2` or newer** — the version this plugin was developed
+  and verified against, and the oldest build it is claimed to work on. The
+  requirement is declared in `package.json` as `peerDependencies` on
+  `@deepseek-ai/dsh-host-webserver` (the route registration this needs) and
+  `@deepseek-ai/dsh-client-ui-slots` (the footer slot the button mounts into).
+  DSH checks those before importing a plugin, so an older build refuses the
+  install with a named reason instead of mounting a button that never draws.
 - **Applies to:** the packaged desktop app. It refuses to run under `dsh web` in a
   terminal, where killing the parent process would kill your shell.
 - **Cost of a restart:** it is a force-kill (`taskkill /T /F`), so a task that is
@@ -28,11 +29,17 @@ call was reproduced against a real `semver` for the cases that matter:
 
 | Harness version | Installs | |
 | --- | --- | --- |
-| `0.1.7-rc.2` | ❌ | no footer slot in that build |
+| `0.1.7-rc.2` | ❌ | below the floor |
 | `0.2.0-rc.1` | ❌ | the release just before the one this was built against |
 | `0.2.0-rc.2` | ✅ | the version this plugin was developed and tested on |
 | `0.2.0-rc.3`, `0.2.0`, `0.2.1` | ✅ | later prereleases and patches of the same minor |
 | `0.3.0` | ❌ | outside the `^` upper bound, so a new minor needs a re-check |
+
+The floor is a statement about where this was tested, not a claim about which
+internal API each earlier build happened to lack — those builds were not available
+to check. What *is* verified is the range itself: DSH's own call was reproduced
+against `semver` 7.8.5, and every row above comes from running it rather than from
+reading it.
 
 A refusal is not a crash: it is one line naming the plugin, the version and the
 peer that did not match, and `dsh plugin allow-version` exists to override it
@@ -181,7 +188,9 @@ node verify/verify-relaunch.mjs    # 助手的"活过自己杀的那棵树"—�
 
 ## 已知边界
 
-- **需要 DSH `0.2.0-rc.2` 或更新的版本。** 更早的构建里没有 `sidebar.footer.action` 这个槽位，按钮没有地方挂。这个要求在 `package.json` 里以 `peerDependencies` 声明（`@deepseek-ai/dsh-host-webserver`、`@deepseek-ai/dsh-client-ui-slots`），DSH 在导入插件前会核对——所以旧版本会**明确拒绝安装并给出原因**，而不是装上一个画不出来的按钮。
+- **需要 DSH `0.2.0-rc.2` 或更新的版本** —— 这是本插件的开发与验证版本，也是它声称能用的最低版本。这个要求在 `package.json` 里以 `peerDependencies` 声明（`@deepseek-ai/dsh-host-webserver` 是注册路由所需，`@deepseek-ai/dsh-client-ui-slots` 是按钮挂载所需的底部槽位）。DSH 在导入插件前会核对——所以旧版本会**明确拒绝安装并给出原因**，而不是装上一个画不出来的按钮。
+
+  需要说明的是：这个下限是"在哪个版本上测过"的陈述，**不是**对每个更早构建内部缺了哪个 API 的断言——那些版本我手上没有，无法核对。真正被验证过的是范围本身：我把 DSH 自己那行判定逻辑拿真实的 `semver` 7.8.5 复现跑过，下表每一行都是**跑出来的结果**，不是读代码推断的。
 
   范围写的是 `^0.2.0-rc.2`（即 `>=0.2.0-rc.2 <0.3.0`），DSH 用 `semver.satisfies(运行时版本, 范围, { includePrerelease: true })` 判定。实测结果：`0.2.0-rc.1` **装不上**，`0.2.0-rc.2` 正常，后续的 `0.2.0-rc.3` / `0.2.0` / `0.2.1` 都可以，`0.3.0` 会因上界被挡下（新的次版本需要重新确认）。被挡下不是崩溃：只会有一行说明是哪个插件、哪个版本、哪个 peer 不匹配；确实想装可以用 `dsh plugin allow-version` 显式豁免。
 - **只支持 Windows 桌面版。** 判断依据是 Host 与 Electron 之间有没有 IPC 通道（`process.connected`）。命令行跑的 `dsh web` 没有这条通道，按钮会拒绝执行并说明原因——在那里"杀掉父进程"等于杀掉你的终端。
