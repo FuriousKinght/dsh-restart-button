@@ -1,0 +1,11 @@
+# Logs and local records produced by a relaunch. The helper writes these next to
+# its config, and they describe one machine's restarts rather than the plugin.
+*.log
+relaunch.log
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
