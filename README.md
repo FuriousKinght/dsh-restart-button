@@ -151,6 +151,35 @@ DSH 桌面版本体是 Electron：`DeepSeek Harness.exe`（主进程）负责窗
 
 （本来还有一条路是 8.3 短路径，可以绕开中文路径。本机这个卷**没开** 8.3：`%~sI` 原样返回长路径。）
 
+### 坑三：**永远不要用裸名调用系统程序**（这个是真正让按钮失效过的）
+
+这是发布之后才暴露出来的 bug，也是这份文档里最值得记住的一条。
+
+本机**机器级 PATH 有两项是坏的**，从注册表读到的原始值：
+
+```
+%Syste;Root%\system32                          ← 分号跑进了变量名里
+%SystemRoot%\System32\WindowsPowerShell\v1.0\  ← 同样坏了
+```
+
+`%Syste;Root%` 展开后是空的，于是 **System32 实际上不在 PATH 上**。实测：
+
+| 调用方式 | 结果 |
+|---|---|
+| `spawn('powershell.exe', …)` | ❌ `ENOENT` |
+| `spawn('taskkill.exe', …)` | ❌ `ENOENT` |
+| `spawn('tasklist.exe', …)` | ❌ `ENOENT` |
+| 以上三者用**绝对路径** | ✅ 全部正常 |
+
+所以规则是：**解析系统程序一律走绝对路径**（`SystemRoot` 优先，`windir` 与 `C:\Windows` 回退），绝不写裸名。
+
+两个附带的教训：
+
+- **错误信息里必须带路径和错误码。** 原来的写法是 `powershell 启动失败`，它把 `ENOENT`、`EPERM` 和其他所有原因压成同一句话、还不说是哪个路径 —— 这就是它藏了整整一天的原因。现在会输出 `C:\WINDOWS\...\powershell.exe 启动失败：ENOENT`。
+- **测试如果用和产品不同的机制，就测不到产品的 bug。** 原来的 `verify-relaunch.mjs` 自己用裸名调用 PowerShell，而它跑在一个 PATH 尚未损坏的 shell 里，于是**一直通过**；而插件运行在后来才启动、继承坏 PATH 的 Host 进程里，一直失败。那个套件现在改为**和插件完全相同的解析方式**，并且新增了 [`verify/verify-route.mjs`](verify/verify-route.mjs) 直接打插件的 HTTP 路由、不自己拼任何命令行。
+
+进程存活检测也顺势去掉了对 `tasklist` 的依赖，改用 `process.kill(pid, 0)` —— 少依赖一个系统程序，就少一个能被 PATH 弄坏的地方。
+
 ### 页面是怎么自己回来的
 
 点重启会把正在服务这个页面的进程杀掉，但**页面本身不会被卸载**，只是连接断了——所以它有机会自己恢复。难点在于：从"点了按钮"到"进程真的被杀"之间有大约 1.2 秒，这期间服务器还在正常应答，如果只是"轮询到服务器有响应就刷新"，会立刻刷新回**旧进程**，看起来像按钮没生效。
@@ -182,9 +211,24 @@ node tools/uninstall.mjs --profile desktop
 ```sh
 node verify/verify-install.mjs     # 浏览器半边的打包链路能不能被扫描器认下来
 node verify/verify-relaunch.mjs    # 助手的"活过自己杀的那棵树"——用替身，不碰正在跑的 DSH
+node verify/verify-route.mjs       # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
 ```
 
-`verify-relaunch.mjs` 是这里最要紧的一个。它复刻了真实的形状：一个替身进程自己通过 WMI 创建助手，助手再 `taskkill /T /F` 杀掉替身那棵树。**如果助手是那棵树里的普通子进程，它自己的这一刀就会把自己带走**，日志会停在半路。测试不额外加任何强制手段——那一刀就是真的那一刀。
+`verify-route.mjs` 是**最要紧的一个**，因为它测的是产品真正会走的那条路：它通过 HTTP 打插件的路由，**不自己拼任何命令行**（这一点是关键 —— 见上面"坑三"里那条教训）。
+
+它用 `?dryRun=1`：助手被**真实创建**、真实验证目标进程与所有系统程序、真实检查端口，然后**在动手之前停下**。所以它随时可以跑，不会打断你手上正在做的事。
+
+输出长这样：
+
+```
+dry run: target alive=true image="DeepSeek Harness.exe" expected="DeepSeek Harness.exe"
+dry run: tasklist="C:\WINDOWS\System32\tasklist.exe" taskkill="C:\WINDOWS\System32\taskkill.exe"
+dry run: target verified, everything needed is present; a real run would kill and relaunch
+```
+
+如果哪一步不对（PATH 坏了、`node.exe` 找不到、目标进程对不上），它会在这里说清楚，而不是等到你按下按钮才发现。
+
+`verify-relaunch.mjs` 测的是另一件事：**助手必须活过它自己要杀的那棵树**。它复刻了真实的形状：一个替身进程自己通过 WMI 创建助手，助手再 `taskkill /T /F` 杀掉替身那棵树。如果助手是那棵树里的普通子进程，它自己的这一刀就会把自己带走，日志会停在半路。测试不额外加任何强制手段 —— 那一刀就是真的那一刀。
 
 ## 已知边界
 
