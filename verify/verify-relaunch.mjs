@@ -20,7 +20,7 @@
 //   node verify/verify-relaunch.mjs
 
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -52,19 +52,53 @@ const check = (label, ok, detail) => {
   if (!ok) failures += 1
 }
 
+/**
+ * Resolve a Windows system binary by absolute path.
+ *
+ * This suite previously called `tasklist.exe` / `powershell.exe` by BARE NAME and
+ * passed, which is exactly why it failed to catch a real defect: those names do
+ * not resolve on this machine (a machine-level PATH has `%Syste;Root%\system32`
+ * instead of `%SystemRoot%\system32`, so System32 is not on PATH). The suite
+ * worked only when run from a shell that had been launched before the corruption -
+ * while the plugin's Host process, spawned later, could not spawn them at all.
+ *
+ * A test that uses a different mechanism than production is not a test of
+ * production. This one now resolves the same way the plugin does.
+ */
+function systemBinary(parts) {
+  const roots = [process.env.SystemRoot, process.env.windir, 'C:\\Windows']
+  for (const root of roots) {
+    if (typeof root !== 'string' || root === '') continue
+    const candidate = join(root, ...parts)
+    try {
+      if (statSync(candidate).isFile()) return candidate
+    } catch {
+      /* next */
+    }
+  }
+  return null
+}
+
+const TASKLIST = systemBinary(['System32', 'tasklist.exe'])
+const TASKKILL = systemBinary(['System32', 'taskkill.exe'])
+const POWERSHELL = systemBinary(['System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'])
+
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms))
 const readLog = () => (existsSync(logPath) ? readFileSync(logPath, 'utf8') : '')
 
+/** Liveness without any external binary, the way the helper now does it. */
 const alive = (pid) => {
-  const result = spawnSync('tasklist.exe', ['/FI', `PID eq ${String(pid)}`, '/NH', '/FO', 'CSV'], {
-    encoding: 'utf8',
-    windowsHide: true,
-  })
-  return String(result.stdout ?? '').includes(`"${String(pid)}"`)
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error.code === 'EPERM'
+  }
 }
 
 const processNameOf = (pid) => {
-  const result = spawnSync('powershell.exe', [
+  if (POWERSHELL === null) return ''
+  const result = spawnSync(POWERSHELL, [
     '-NoProfile', '-Command',
     `(Get-Process -Id ${String(pid)} -ErrorAction SilentlyContinue).ProcessName`,
   ], { encoding: 'utf8', windowsHide: true })
@@ -72,29 +106,38 @@ const processNameOf = (pid) => {
 }
 
 const parentOf = (pid) => {
-  const result = spawnSync('powershell.exe', [
+  if (POWERSHELL === null) return Number.NaN
+  const result = spawnSync(POWERSHELL, [
     '-NoProfile', '-Command',
     `(Get-CimInstance Win32_Process -Filter "ProcessId=${String(pid)}").ParentProcessId`,
   ], { encoding: 'utf8', windowsHide: true })
   return Number.parseInt(String(result.stdout ?? '').trim(), 10)
 }
 
-console.log(`scratch : ${scratch}`)
-console.log(`node    : ${NODE}`)
+// The environment itself is now part of what is under test, so it is reported.
+console.log(`scratch   : ${scratch}`)
+console.log(`node      : ${NODE}`)
+console.log(`tasklist  : ${String(TASKLIST)}`)
+console.log(`taskkill  : ${String(TASKKILL)}`)
+console.log(`powershell: ${String(POWERSHELL)}`)
 console.log('')
 
+check('every system binary the plugin needs was resolved by absolute path', TASKLIST !== null && TASKKILL !== null && POWERSHELL !== null)
 check('the helper script exists', existsSync(helperScript), helperScript)
 if (failures > 0) process.exit(1)
 
 // --- the stand-in application ---------------------------------------------
 // It creates the helper through WMI exactly as the plugin does, records what it
 // did for the observer, and then simply waits to be killed.
+//
+// The PowerShell path is interpolated rather than written as a bare name: this
+// stand-in runs as a normal child and inherits a PATH without System32 on it.
 writeFileSync(standInPath, `
 'use strict'
 const { spawnSync } = require('node:child_process')
 const fs = require('node:fs')
 
-const [, , configPath, logPath, handshakePath, port] = process.argv
+const [, , configPath, logPath, handshakePath, port, powerShellPath] = process.argv
 
 fs.writeFileSync(configPath, JSON.stringify({
   appPid: process.pid,
@@ -109,20 +152,21 @@ const commandLine = '"' + process.execPath + '" "' + ${JSON.stringify(helperScri
 const script = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create '
   + "-Arguments @{ CommandLine = '" + commandLine.replace(/'/g, "''") + "' } | "
   + 'Select-Object -ExpandProperty ProcessId'
-const created = spawnSync('powershell.exe', [
+const created = spawnSync(powerShellPath, [
   '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script,
 ], { encoding: 'utf8', windowsHide: true })
 
 fs.writeFileSync(handshakePath, JSON.stringify({
   appPid: process.pid,
   helperPid: Number.parseInt(String(created.stdout || '').trim(), 10) || null,
+  spawnError: created.error ? String(created.error.code || created.error.message) : null,
   logPath,
 }), 'utf8')
 
 setInterval(() => {}, 1000)
 `, 'utf8')
 
-const standIn = spawn(NODE, [standInPath, configPath, logPath, handshakePath, String(PORT)], {
+const standIn = spawn(NODE, [standInPath, configPath, logPath, handshakePath, String(PORT), String(POWERSHELL)], {
   stdio: 'ignore',
   windowsHide: true,
 })
@@ -175,7 +219,8 @@ check('it logged the kill', /taskkill exit=0/i.test(log))
 check('it relaunched the executable', /launched pid \d+/i.test(log))
 
 if (handshake !== null && alive(handshake.appPid)) {
-  spawnSync('taskkill.exe', ['/PID', String(handshake.appPid), '/T', '/F'], { windowsHide: true })
+  if (TASKKILL !== null) spawnSync(TASKKILL, ['/PID', String(handshake.appPid), '/T', '/F'], { windowsHide: true })
+  else process.kill(handshake.appPid, 'SIGKILL')
 }
 try { standIn.kill() } catch { /* already gone */ }
 
