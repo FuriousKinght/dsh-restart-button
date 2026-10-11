@@ -438,18 +438,28 @@ export function apply(ctx) {
         sendJson(res, 409, { ok: false, error: target.reason })
         return
       }
-      if (restarting) {
-        sendJson(res, 409, { ok: false, error: '已经有一次重启在进行了。' })
-        return
+      // `?dryRun=1` creates the helper and lets it check everything it would
+      // need, but stops it before the kill. It exists so this whole path can be
+      // exercised - by a person or by verify/verify-route.mjs - without
+      // restarting a DSH that may be in the middle of something.
+      const dryRun = new URL(req.url, 'http://127.0.0.1').searchParams.get('dryRun') === '1'
+
+      // The guard is deliberately NOT taken for a dry run, and that is a fix
+      // rather than a convenience. `restarting` is cleared only when a restart
+      // completes or fails, and a dry run does neither - it leaves the process
+      // alive on purpose. Setting it here would latch this flag forever: after a
+      // single dry run the button would answer "已经有一次重启在进行了" for the rest
+      // of the app's life. A dry run also kills nothing, so there is no second
+      // helper to guard against.
+      if (!dryRun) {
+        if (restarting) {
+          sendJson(res, 409, { ok: false, error: '已经有一次重启在进行了。' })
+          return
+        }
+        restarting = true
       }
-      restarting = true
 
       void (async () => {
-        // `?dryRun=1` creates the helper and lets it check everything it would
-        // need, but stops it before the kill. It exists so this whole path can be
-        // exercised - by a person or by verify/verify-route.mjs - without
-        // restarting a DSH that may be in the middle of something.
-        const dryRun = new URL(req.url, 'http://127.0.0.1').searchParams.get('dryRun') === '1'
         const started = await startHelper(target, dryRun)
         if (started.helperPid === null) {
           // Nothing was killed, so the session is intact and the failure can be
