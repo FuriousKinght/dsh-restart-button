@@ -186,6 +186,13 @@ DSH 桌面版本体是 Electron：`DeepSeek Harness.exe`（主进程）负责窗
 
 所以 Host 每一份响应都带一个只属于本进程的 `token`。页面记住当前 token，重启后**等一个不一样的 token**——不同的 token 只可能来自不同的进程，正好就是它在等的东西。不靠超时猜、不靠计时赌。
 
+初版还额外要求"必须先观察到一次连接失败"才认这个新 token。那个条件后来去掉了，因为它**既没用又有害**：
+
+- **没用**：代码里另有一个分支在 `token` 不同时无条件刷新，所以那个条件从来没真正拦住过什么——注释声称它防住的情况，其实防不住。
+- **有害**：应用通常一两秒就回来了，而轮询间隔是 800 毫秒，完全可能**第一次轮询时新进程已经在服务**。要求页面必须亲眼看到那个空档，会把一次顺利的重启变成超时失败。
+
+现在只有一条规则：**token 不同就刷新**。token 是进程的身份，它比"有没有看到断开"可靠得多。
+
 ---
 
 ## 安装
@@ -209,9 +216,10 @@ node tools/uninstall.mjs --profile desktop
 ## 验证
 
 ```sh
-node verify/verify-install.mjs     # 浏览器半边的打包链路能不能被扫描器认下来
-node verify/verify-relaunch.mjs    # 助手的"活过自己杀的那棵树"——用替身，不碰正在跑的 DSH
-node verify/verify-route.mjs       # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
+node verify/verify-install.mjs        # 浏览器半边的打包链路能不能被扫描器认下来
+node verify/verify-relaunch.mjs       # 助手的"活过自己杀的那棵树"——用替身，不碰正在跑的 DSH
+node verify/verify-launch-failure.mjs # 启动失败时，助手要活下来并把原因写进日志
+node verify/verify-route.mjs          # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
 ```
 
 `verify-route.mjs` 是**最要紧的一个**，因为它测的是产品真正会走的那条路：它通过 HTTP 打插件的路由，**不自己拼任何命令行**（这一点是关键 —— 见上面"坑三"里那条教训）。
@@ -228,7 +236,15 @@ dry run: target verified, everything needed is present; a real run would kill an
 
 如果哪一步不对（PATH 坏了、`node.exe` 找不到、目标进程对不上），它会在这里说清楚，而不是等到你按下按钮才发现。
 
-`verify-relaunch.mjs` 测的是另一件事：**助手必须活过它自己要杀的那棵树**。它复刻了真实的形状：一个替身进程自己通过 WMI 创建助手，助手再 `taskkill /T /F` 杀掉替身那棵树。如果助手是那棵树里的普通子进程，它自己的这一刀就会把自己带走，日志会停在半路。测试不额外加任何强制手段 —— 那一刀就是真的那一刀。
+`verify-launch-failure.mjs` 守的是另一条**很容易写错**的路径。`spawn` 启动一个不存在的程序时**不会抛异常** —— 它异步发一个 `'error'` 事件，而 `EventEmitter` 的 `'error'` 事件如果没有监听器，会**直接变成未捕获异常把进程干掉**。所以把 `spawn` 包在 `try/catch` 里是**没用的**：
+
+```js
+try { spawn('不存在的.exe') } catch { /* 永远进不来 */ }
+```
+
+初版就是这么写的。后果是：三次重试到第三次时助手崩溃，那句 `LAUNCH FAILED - DSH has to be reopened by hand` **永远不会写进日志** —— 恰恰是在最需要它的时刻。现在 `launch()` 监听 `'spawn'`（真的起来了）和 `'error'`（没起来）两个事件，测试让它在真实文件缺失的情况下跑完整个阶梯，断言日志里有三次失败和那句收尾。
+
+`verify-relaunch.mjs` 测的是**助手必须活过它自己要杀的那棵树**。它复刻了真实的形状：一个替身进程自己通过 WMI 创建助手，助手再 `taskkill /T /F` 杀掉替身那棵树。如果助手是那棵树里的普通子进程，它自己的这一刀就会把自己带走，日志会停在半路。测试不额外加任何强制手段 —— 那一刀就是真的那一刀。
 
 ## 已知边界
 
