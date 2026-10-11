@@ -143,6 +143,26 @@ check(
   /target NOT verified/.test(fresh) ? 'the helper would refuse a real run' : '',
 )
 
+// --- 3b. a dry run must not latch the in-flight guard ----------------------
+//
+// A dry run leaves the process alive on purpose, so the `restarting` flag that
+// guards against a second helper can never be cleared by one. Taking it anyway
+// latches the flag for the remaining life of the app: the button then answers
+// "已经有一次重启在进行了" forever. That was a real defect, introduced with the dry
+// run itself and caught by running this suite twice - so run it twice.
+const repeat = await fetch(`${ROUTE}/restart?dryRun=1`, { method: 'POST' })
+const repeatBody = await repeat.json()
+console.log('')
+console.log(`POST /restart?dryRun=1 (second time) -> HTTP ${String(repeat.status)}`)
+console.log(`  ${JSON.stringify(repeatBody)}`)
+console.log('')
+check('a second dry run still works', repeat.status === 200, String(repeatBody?.error ?? ''))
+check(
+  'the first dry run did not latch the in-flight guard',
+  repeat.status !== 409,
+  repeat.status === 409 ? 'the guard was left set - the button would be dead' : '',
+)
+
 // --- 4. nothing may have been disturbed -----------------------------------
 
 let stillHere = null
