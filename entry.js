@@ -128,6 +128,46 @@ function findNodeBinary(dir, depth) {
 }
 
 /**
+ * Resolve a Windows system binary by absolute path.
+ *
+ * This plugin must never spawn a system tool by BARE NAME, and that is not
+ * theoretical: it is the bug that broke the restart button on the machine this was
+ * written for. That box has a machine-level PATH with two mangled entries
+ * (`%Syste;Root%\system32` instead of `%SystemRoot%\system32`), so System32 is
+ * genuinely not on PATH and `spawn('powershell.exe')` fails with ENOENT even
+ * though the file is exactly where Windows keeps it. Measured: `powershell.exe`,
+ * `cmd.exe`, `taskkill.exe`, `tasklist.exe` and even `node.exe` are all
+ * unreachable by name there, and all of them run when given a full path.
+ *
+ * `SystemRoot` is used rather than a hardcoded `C:\Windows`, and its usual
+ * fallbacks are tried in order, so this works on a machine where Windows lives
+ * elsewhere.
+ *
+ * @param parts - path segments below the Windows directory, e.g.
+ *   `['System32', 'taskkill.exe']`.
+ * @returns the absolute path that exists, or null when none does.
+ */
+function systemBinary(parts) {
+  const roots = [
+    process.env.SystemRoot,
+    process.env.windir,
+    'C:\\Windows',
+  ]
+  const seen = new Set()
+  for (const root of roots) {
+    if (typeof root !== 'string' || root === '' || seen.has(root)) continue
+    seen.add(root)
+    const candidate = join(root, ...parts)
+    try {
+      if (statSync(candidate).isFile()) return candidate
+    } catch {
+      /* try the next root */
+    }
+  }
+  return null
+}
+
+/**
  * Locate the Node runtime that will run the helper.
  *
  * The desktop payload keeps exactly one, under `resources/runtime`. The plugin
@@ -215,9 +255,11 @@ function resolveTarget() {
  * `Win32_Process.Create` produces a process parented to WmiPrvSE instead, which
  * survives the kill and is therefore able to relaunch the app.
  * @param target - resolved target description.
+ * @param dryRun - when true the helper is told to verify everything and stop
+ *   short of killing anything. See the note on the config's `dryRun` field.
  * @returns the created helper's PID, or an explanation of the failure.
  */
-async function startHelper(target) {
+async function startHelper(target, dryRun = false) {
   const node = resolveNode()
   if (node === null) {
     return { helperPid: null, error: '找不到 DSH 自带的 node.exe，无法启动重启助手' }
@@ -246,6 +288,10 @@ async function startHelper(target) {
     port: DESKTOP_PORT,
     workingDir: target.workingDir ?? null,
     env,
+    // A dry run exists so the whole creation path can be exercised - and tested -
+    // without disturbing a running DSH. The helper still verifies the target, the
+    // tools and the port, then stops before the kill; see its own note.
+    dryRun,
     requestedAt: new Date().toISOString(),
   }, null, 2), 'utf8')
 
@@ -257,19 +303,43 @@ async function startHelper(target) {
     + `-Arguments @{ CommandLine = '${commandLine.replace(/'/g, "''")}' } | `
     + 'Select-Object -ExpandProperty ProcessId'
 
+  // Absolute, never 'powershell.exe'. See `systemBinary` for the measured reason.
+  const shell = systemBinary(['System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'])
+  if (shell === null) {
+    return {
+      helperPid: null,
+      error: '找不到 powershell.exe（System32\\WindowsPowerShell\\v1.0），无法通过 WMI 创建重启助手',
+      dir,
+      logPath: join(dir, 'relaunch.log'),
+      node,
+    }
+  }
+
   const created = await new Promise((resolve) => {
-    const child = spawn('powershell.exe', [
+    const child = spawn(shell, [
       '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', psCommand,
     ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     let out = ''
     let err = ''
     child.stdout.on('data', (chunk) => { out += String(chunk) })
     child.stderr.on('data', (chunk) => { err += String(chunk) })
-    child.on('error', () => resolve({ pid: null, error: 'powershell 启动失败' }))
-    child.on('close', () => {
+    // The failure reason is carried through rather than flattened. The original
+    // version answered "powershell 启动失败" for every possible cause, which is how
+    // a PATH problem stayed invisible: `error.code` names ENOENT versus EPERM, and
+    // the attempted path says which one was missing.
+    child.on('error', (error) => {
+      resolve({
+        pid: null,
+        error: `${shell} 启动失败：${String(error.code ?? error.message)}`,
+      })
+    })
+    child.on('close', (code) => {
       const pid = Number.parseInt(out.trim(), 10)
       if (Number.isFinite(pid) && pid > 0) resolve({ pid })
-      else resolve({ pid: null, error: err.trim() || out.trim() || 'WMI 没有返回进程号' })
+      else {
+        const detail = err.trim() || out.trim() || '(没有输出)'
+        resolve({ pid: null, error: `WMI 没有返回进程号（powershell 退出码 ${String(code)}）：${detail}` })
+      }
     })
   })
 
@@ -375,7 +445,12 @@ export function apply(ctx) {
       restarting = true
 
       void (async () => {
-        const started = await startHelper(target)
+        // `?dryRun=1` creates the helper and lets it check everything it would
+        // need, but stops it before the kill. It exists so this whole path can be
+        // exercised - by a person or by verify/verify-route.mjs - without
+        // restarting a DSH that may be in the middle of something.
+        const dryRun = new URL(req.url, 'http://127.0.0.1').searchParams.get('dryRun') === '1'
+        const started = await startHelper(target, dryRun)
         if (started.helperPid === null) {
           // Nothing was killed, so the session is intact and the failure can be
           // reported honestly rather than pretended away.
@@ -388,13 +463,15 @@ export function apply(ctx) {
           return
         }
         ctx.logger?.info?.(
-          `restart-button: helper pid ${String(started.helperPid)} will restart the app; `
+          `restart-button: helper pid ${String(started.helperPid)} `
+          + `${dryRun ? 'is doing a dry run' : 'will restart the app'}; `
           + `log at ${started.logPath}`,
         )
         // Answered BEFORE the helper's 1.2 s grace expires, so the browser learns
         // the restart is under way and can start polling for the new process.
         sendJson(res, 200, {
           ok: true,
+          dryRun,
           helperPid: started.helperPid,
           logPath: started.logPath,
           token: BOOT_TOKEN,
