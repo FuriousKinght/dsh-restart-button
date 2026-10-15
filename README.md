@@ -180,6 +180,45 @@ DSH 桌面版本体是 Electron：`DeepSeek Harness.exe`（主进程）负责窗
 
 进程存活检测也顺势去掉了对 `tasklist` 的依赖，改用 `process.kill(pid, 0)` —— 少依赖一个系统程序，就少一个能被 PATH 弄坏的地方。
 
+### 坑四：**WMI 创建的进程会弹出可见终端窗口**（用户实际遇到的）
+
+这是用户报告的问题：**点重启会弹出一个命令行窗口，手快关掉它，重启就彻底失败，插件一直转圈到超时。**
+
+根因是创建助手时**没有传启动信息**：
+
+```powershell
+# 有问题的写法
+Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = '...' }
+```
+
+没有 `ProcessStartupInformation` 时，WMI 会**给这个控制台程序分配一个控制台**，而控制台就是一个可见的终端窗口。在装了 Windows Terminal 的机器上，它表现为一个标题是 node.exe 路径的终端窗口。**而那个控制台就是助手自己的** —— 关掉窗口 = 终止进程，于是：
+
+| 现象 | 原因 |
+|---|---|
+| 弹出命令行窗口 | WMI 给控制台程序分配了可见终端 |
+| 关掉它 → 重启不生效 | 那是助手自己的控制台，关窗即杀进程 |
+| 一直转圈到超时 | 助手已死，没人去杀 DSH，页面只能等到超时 |
+
+四种创建方式的实测结果：
+
+| 方式 | 结果 |
+|---|---|
+| 不传启动信息 | ❌ 弹出 2 个终端窗口 |
+| `ShowWindow = 0`（SW_HIDE） | ✅ 无窗口 |
+| `CreateFlags = CREATE_NO_WINDOW` | ❌ **创建被拒绝**（返回 pid 0） |
+| `CreateFlags = DETACHED_PROCESS` | ✅ 无窗口 |
+
+选 `ShowWindow = 0`：它保留了普通控制台语义，而 `DETACHED_PROCESS` 会完全移除控制台 —— 效果相同但是更大的行为改变，没有必要。
+
+**探测这个问题时我又踩了一次同样的错**：第一次我用 `ConsoleWindowClass` 去找窗口，报告"没有窗口"，而窗口明明在屏幕上 —— 因为 Windows Terminal 的窗口类名是 `CASCADIA_HOSTING_WINDOW_CLASS`。**探测方法会漏，而漏掉的结果看起来和"没问题"一模一样。** 这和截图漏图层是同一类错误，所以测试现在同时检查三个类名。
+
+另外两处一并修了：
+
+- **`launch()` 改成 `windowsHide: true`** —— 原来是 `false`，那会让**重启后的 DSH 自己**也带一个控制台窗口，是同一个缺陷在链条的另一端。
+- **助手意外死亡现在会被报出来。** 之前如果助手因为任何原因死掉，Host 还活着、还在正常应答，页面每次轮询都只看到"还没回来"，只能空转到 90 秒超时，最后给出的还是描述现象的 `DSH 在规定时间内没有回来`。现在 Host 会盯着助手进程，一旦它在重启途中消失，就通过 `/info` 的 `restartFailed` 字段上报，页面**立即**停下并说明真实原因。
+
+那个判断抽成了导出的纯函数 `helperDeathVerdict`，由独立测试守着 —— 因为它两个方向都错得很安静：**把 dry run 结束误报成失败**会让每次自检都显示错误，**漏报真实失败**就退回 90 秒空转。
+
 ### 页面是怎么自己回来的
 
 点重启会把正在服务这个页面的进程杀掉，但**页面本身不会被卸载**，只是连接断了——所以它有机会自己恢复。难点在于：从"点了按钮"到"进程真的被杀"之间有大约 1.2 秒，这期间服务器还在正常应答，如果只是"轮询到服务器有响应就刷新"，会立刻刷新回**旧进程**，看起来像按钮没生效。
@@ -216,11 +255,19 @@ node tools/uninstall.mjs --profile desktop
 ## 验证
 
 ```sh
-node verify/verify-install.mjs        # 浏览器半边的打包链路能不能被扫描器认下来
-node verify/verify-relaunch.mjs       # 助手的"活过自己杀的那棵树"——用替身，不碰正在跑的 DSH
-node verify/verify-launch-failure.mjs # 启动失败时，助手要活下来并把原因写进日志
-node verify/verify-route.mjs          # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
+node verify/verify-install.mjs          # 浏览器半边的打包链路能不能被扫描器认下来
+node verify/verify-relaunch.mjs         # 助手的"活过自己杀的那棵树"——用替身，不碰正在跑的 DSH
+node verify/verify-launch-failure.mjs   # 启动失败时，助手要活下来并把原因写进日志
+node verify/verify-helper-death.mjs     # 助手意外死亡必须被上报，且 dry run 结束不能被误报
+node verify/verify-no-console-window.mjs # 创建助手不得弹出终端窗口 —— 需要 DSH 在跑
+node verify/verify-route.mjs            # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
 ```
+
+`verify-no-console-window.mjs` 守的是用户实际撞到的那个 bug。它枚举屏幕上可见的终端窗口，再按一次重启（dry run），要求**一个新窗口都不出现**。修复前它报 `new: 2`，修复后是 `new: 0` —— 同一份测试，先复现再验证。
+
+它同时检查三个窗口类名（`CASCADIA_HOSTING_WINDOW_CLASS`、`ConsoleWindowClass`、`PseudoConsoleWindow`），因为只查经典的那个会漏掉 Windows Terminal 窗口，而"没找到"看起来和"没问题"完全一样。
+
+`verify-helper-death.mjs` 分两半：一半直接测导出的纯函数 `helperDeathVerdict` 的四种输入，一半确认运行中的 Host 真的在 `/info` 里送 `restartFailed` 字段 —— 函数正确但字段没送出去，等于没修。
 
 `verify-route.mjs` 是**最要紧的一个**，因为它测的是产品真正会走的那条路：它通过 HTTP 打插件的路由，**不自己拼任何命令行**（这一点是关键 —— 见上面"坑三"里那条教训）。
 
