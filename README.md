@@ -212,10 +212,43 @@ Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ Comma
 
 **探测这个问题时我又踩了一次同样的错**：第一次我用 `ConsoleWindowClass` 去找窗口，报告"没有窗口"，而窗口明明在屏幕上 —— 因为 Windows Terminal 的窗口类名是 `CASCADIA_HOSTING_WINDOW_CLASS`。**探测方法会漏，而漏掉的结果看起来和"没问题"一模一样。** 这和截图漏图层是同一类错误，所以测试现在同时检查三个类名。
 
-另外两处一并修了：
+另外修了一处相关的问题：
 
-- **`launch()` 改成 `windowsHide: true`** —— 原来是 `false`，那会让**重启后的 DSH 自己**也带一个控制台窗口，是同一个缺陷在链条的另一端。
 - **助手意外死亡现在会被报出来。** 之前如果助手因为任何原因死掉，Host 还活着、还在正常应答，页面每次轮询都只看到"还没回来"，只能空转到 90 秒超时，最后给出的还是描述现象的 `DSH 在规定时间内没有回来`。现在 Host 会盯着助手进程，一旦它在重启途中消失，就通过 `/info` 的 `restartFailed` 字段上报，页面**立即**停下并说明真实原因。
+
+### 坑五：**同一个 `windowsHide`，对这两种程序的意思完全不同**（我修坑四时亲手引入的回归）
+
+修好弹窗之后，我"顺手"把 `launch()` 里的 `windowsHide` 也从 `false` 改成了 `true`，理由是"这是同一个缺陷在链条的另一端"。
+
+**这个推理是错的，而且它让重启后的程序跑在后台、没有窗口。** 用户报告的正是这个现象。
+
+两个程序根本不是一类东西 —— PE 头给出的事实：
+
+| 可执行文件 | PE 子系统 | 有控制台吗 | `windowsHide: true` 的后果 |
+|---|---|---|---|
+| `node.exe`（助手） | **3 = CONSOLE** | 有 | ✅ 消除可被关闭的弹窗 |
+| `DeepSeek Harness.exe`（应用） | **2 = GUI** | **没有** | ❌ **连它自己的窗口一起隐藏** |
+
+原因是 `windowsHide: true` 在 Node 里映射到 libuv 的 `UV_PROCESS_WINDOWS_HIDE`，它**同时**设置两样东西：
+
+```
+CREATE_NO_WINDOW                  → 隐藏控制台
+STARTF_USESHOWWINDOW + SW_HIDE    → 隐藏 GUI 窗口
+```
+
+GUI 程序没有控制台可隐藏，于是那个 `SW_HIDE` 就落到了**它自己的第一个窗口**上 —— 程序正常启动、正常工作，只是屏幕上什么都没有。
+
+现在的做法是**从二进制读出来**，而不是写死：
+
+```js
+const subsystem = peSubsystem(exePath)   // 读 PE 头：2=GUI，3=CONSOLE
+const hide = subsystem === 3             // 只有控制台程序才隐藏
+log(`launch: subsystem=... windowsHide=...`)   // 决策写进日志
+```
+
+这样即使将来 exe 改名或换类型，行为也会跟着变，而不是靠一句注释维持。测试 [`verify-gui-not-hidden.mjs`](verify/verify-gui-not-hidden.mjs) 守着三件事：助手**派生**而不是写死、**真实的 exe 确实是 GUI**（读 PE 头）、**`node.exe` 确实是控制台程序**（对照组 —— 没有它，"隐藏控制台程序"这条规则可以靠"全都隐藏"来满足）。
+
+**教训**：我看到了同一种症状（窗口），就假设了同一种原因，**没有先确认这两个可执行文件是不是同一类东西**。一个字节的 PE 头字段就能回答，而我是在造成回归之后才去读的。
 
 那个判断抽成了导出的纯函数 `helperDeathVerdict`，由独立测试守着 —— 因为它两个方向都错得很安静：**把 dry run 结束误报成失败**会让每次自检都显示错误，**漏报真实失败**就退回 90 秒空转。
 
@@ -255,13 +288,16 @@ node tools/uninstall.mjs --profile desktop
 ## 验证
 
 ```sh
-node verify/verify-install.mjs          # 浏览器半边的打包链路能不能被扫描器认下来
-node verify/verify-relaunch.mjs         # 助手的"活过自己杀的那棵树"——用替身，不碰正在跑的 DSH
-node verify/verify-launch-failure.mjs   # 启动失败时，助手要活下来并把原因写进日志
-node verify/verify-helper-death.mjs     # 助手意外死亡必须被上报，且 dry run 结束不能被误报
+node verify/verify-install.mjs           # 浏览器半边的打包链路能不能被扫描器认下来
+node verify/verify-relaunch.mjs          # 助手的"活过自己杀的那棵树"——用替身，不碰正在跑的 DSH
+node verify/verify-launch-failure.mjs    # 启动失败时，助手要活下来并把原因写进日志
+node verify/verify-helper-death.mjs      # 助手意外死亡必须被上报，且 dry run 结束不能被误报
+node verify/verify-gui-not-hidden.mjs    # GUI 程序不得被隐藏启动（防止后台运行的回归）
 node verify/verify-no-console-window.mjs # 创建助手不得弹出终端窗口 —— 需要 DSH 在跑
-node verify/verify-route.mjs            # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
+node verify/verify-route.mjs             # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
 ```
+
+`verify-gui-not-hidden.mjs` 守的是**我自己引入的回归**：修好弹窗后我顺手把应用的 `windowsHide` 也改成 `true`，导致重启后的程序在后台运行。它断言三件事 —— 助手从 PE 头**派生**这个标志、**真实的 exe 确实是 GUI**、**`node.exe` 确实是控制台程序**。最后一条是**对照组**：没有它，"只隐藏控制台程序"这条规则可以靠"全都隐藏"来满足，而"全都隐藏"正是那个 bug。
 
 `verify-no-console-window.mjs` 守的是用户实际撞到的那个 bug。它枚举屏幕上可见的终端窗口，再按一次重启（dry run），要求**一个新窗口都不出现**。修复前它报 `new: 2`，修复后是 `new: 0` —— 同一份测试，先复现再验证。
 
