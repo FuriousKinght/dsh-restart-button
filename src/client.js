@@ -176,8 +176,20 @@ function RestartButton(props) {
             return
           }
           if (info.token === known) {
-            // The same process is still answering. Either the restart has not
-            // reached it yet or it never will; keep waiting for the deadline.
+            // The same process is still answering, so nothing has restarted yet.
+            //
+            // But it may be answering to say the attempt FAILED. This is the case
+            // that a user hit: a console window appeared, they closed it, that
+            // killed the helper, and because this Host was still alive and still
+            // responding, every poll looked like "not back yet" until the deadline.
+            // Reporting it now turns a 90-second spin into an immediate, accurate
+            // message.
+            if (typeof info.restartFailed === 'string' && info.restartFailed !== '') {
+              setBusy(false)
+              setPhase('failed')
+              setFailure(info.restartFailed)
+              return
+            }
             timerRef.current = setTimeout(poll, POLL_MS)
             return
           }
