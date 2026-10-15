@@ -299,9 +299,38 @@ async function startHelper(target, dryRun = false) {
   // quoting is correct, and CJK in either path is safe because the string is
   // carried as UTF-16 the whole way.
   const commandLine = `"${node}" "${HELPER_SCRIPT}" "${configPath}"`
+
+  // The startup information is NOT optional, and leaving it out was a real bug.
+  //
+  // `Win32_Process.Create` with no `ProcessStartupInformation` lets WMI allocate a
+  // console to this process, and a console means a VISIBLE terminal window - on
+  // this machine a Windows Terminal window titled with the node.exe path, because
+  // Windows Terminal is the registered default terminal. The user sees a CMD-like
+  // window appear, and if they close it they kill the helper: the console is the
+  // helper's, so closing the window terminates it. The restart then never happens
+  // and the page spins until it times out.
+  //
+  // Measured on this machine with the four candidate settings (the window class to
+  // look for is CASCADIA_HOSTING_WINDOW_CLASS, not the classic ConsoleWindowClass -
+  // an earlier probe searched for the classic one and wrongly reported no window):
+  //
+  //   plain         2 new terminal windows   <- the bug
+  //   ShowWindow=0  0 new terminal windows
+  //   CreateFlags=CREATE_NO_WINDOW  creation REFUSED (pid 0)
+  //   CreateFlags=DETACHED_PROCESS 0 new terminal windows
+  //
+  // `ShowWindow: 0` (SW_HIDE) is used rather than DETACHED_PROCESS: hiding keeps
+  // the ordinary console semantics, while DETACHED_PROCESS removes the console
+  // entirely - a larger behavioural change than this needs, for the same result.
+  //
+  // `ShowWindow` is also what the shell's own `windowsHide` maps to, so this is the
+  // same mechanism Node uses when it launches a hidden child.
   const psCommand = 'Invoke-CimMethod -ClassName Win32_Process -MethodName Create '
-    + `-Arguments @{ CommandLine = '${commandLine.replace(/'/g, "''")}' } | `
-    + 'Select-Object -ExpandProperty ProcessId'
+    + '-Arguments @{ '
+    + `CommandLine = '${commandLine.replace(/'/g, "''")}'; `
+    + 'ProcessStartupInformation = ([ciminstance]::new((Get-CimClass -ClassName Win32_ProcessStartup)) | '
+    + 'ForEach-Object { $_.ShowWindow = 0; $_ }) '
+    + '} | Select-Object -ExpandProperty ProcessId'
 
   // Absolute, never 'powershell.exe'. See `systemBinary` for the measured reason.
   const shell = systemBinary(['System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'])
@@ -353,6 +382,34 @@ async function startHelper(target, dryRun = false) {
 }
 
 /**
+ * Decide what a helper's disappearance means.
+ *
+ * Exported so it can be verified directly. It is a small decision, and that is
+ * precisely why it is worth isolating: getting it wrong produces either a false
+ * failure on a healthy restart or the silent 90-second spin this was written to
+ * remove, and neither shows up until someone presses the button.
+ *
+ * The reasoning, in order:
+ *
+ * - A helper that is still alive has decided nothing yet.
+ * - A helper that exited while nothing was in flight is expected: that is a dry
+ *   run finishing, which is success, not failure.
+ * - A helper that exited while a RESTART was in flight is the failure case. It
+ *   did not kill this process - this process is running the check - so the restart
+ *   it promised did not happen.
+ *
+ * @param state - the facts at one poll.
+ * @param state.alive - whether the helper process still exists.
+ * @param state.restarting - whether a real (non-dry) restart is in flight.
+ * @returns a message for the browser, or null when nothing has gone wrong.
+ */
+export function helperDeathVerdict(state) {
+  if (state.alive) return null
+  if (!state.restarting) return null
+  return '重启助手提前退出了（DSH 没有被关闭也没有重启）。请查看重启日志。'
+}
+
+/**
  * Mount the two routes and answer them.
  * @param ctx - Host plugin context.
  */
@@ -363,6 +420,56 @@ export function apply(ctx) {
   // lives only in this process, which is correct: it guards the window between
   // "helper started" and "this process is gone".
   let restarting = false
+
+  // Why the restart is considered to have failed, when it has. Reported through
+  // `/info` so the page can stop waiting instead of spinning out its whole timeout.
+  //
+  // This exists because of a reported failure: a console window appeared when the
+  // button was pressed, the user closed it, that killed the helper, and the page
+  // then had nothing to observe - the Host was still alive and still answering, so
+  // every poll looked like "not back yet" until the deadline. The window itself is
+  // fixed by the `Win32_ProcessStartup` change in `startHelper`; this is the
+  // detection, so that ANY future death of the helper is reported rather than
+  // waited out.
+  let restartFailed = null
+  let helperWatch = null
+
+  /**
+   * Watch the created helper and record its death.
+   *
+   * `process.kill(pid, 0)` is used rather than `tasklist`, for the same reason the
+   * helper uses it: it needs no external binary, and on this machine the PATH is
+   * damaged enough that bare-name spawns fail.
+   *
+   * @param pid - the helper's process id.
+   */
+  const watchHelper = (pid) => {
+    if (helperWatch !== null) clearInterval(helperWatch)
+    helperWatch = setInterval(() => {
+      let alive = true
+      try {
+        process.kill(pid, 0)
+      } catch (error) {
+        alive = error.code === 'EPERM'
+      }
+      const verdict = helperDeathVerdict({ alive, restarting })
+      if (verdict === null) {
+        if (!alive) {
+          // Gone, and that was fine - a dry run ends by itself. Stop watching.
+          clearInterval(helperWatch)
+          helperWatch = null
+        }
+        return
+      }
+      clearInterval(helperWatch)
+      helperWatch = null
+      restarting = false
+      restartFailed = verdict
+      ctx.logger?.error?.(`restart-button: helper ${String(pid)} died without restarting anything`)
+    }, 500)
+    // Do not hold the process open for this.
+    if (typeof helperWatch.unref === 'function') helperWatch.unref()
+  }
 
   /**
    * Whether the client-module registry accepted this package's browser half.
@@ -395,6 +502,10 @@ export function apply(ctx) {
       token: BOOT_TOKEN,
       pid: process.pid,
       restarting,
+      // Non-null while a restart has failed and this process is still alive to say
+      // so. The page uses it to stop waiting immediately rather than polling until
+      // its deadline, which is what the closed-console report looked like.
+      restartFailed,
       available: target.ok && node !== null,
       reason: target.ok
         ? (node === null ? '找不到 DSH 自带的 node.exe，重启助手无法运行。' : null)
@@ -457,6 +568,8 @@ export function apply(ctx) {
           return
         }
         restarting = true
+        // A fresh attempt clears the previous verdict.
+        restartFailed = null
       }
 
       void (async () => {
@@ -465,6 +578,7 @@ export function apply(ctx) {
           // Nothing was killed, so the session is intact and the failure can be
           // reported honestly rather than pretended away.
           restarting = false
+          restartFailed = String(started.error)
           ctx.logger?.error?.('restart-button: helper was not created', started.error)
           sendJson(res, 500, {
             ok: false,
@@ -472,6 +586,11 @@ export function apply(ctx) {
           })
           return
         }
+        // Watched even for a dry run. The decision function already knows a dry
+        // run ending is not a failure, and watching it means the detection path
+        // runs on every self-check instead of only in theory - which is how the
+        // bug this addresses survived review in the first place.
+        watchHelper(started.helperPid)
         ctx.logger?.info?.(
           `restart-button: helper pid ${String(started.helperPid)} `
           + `${dryRun ? 'is doing a dry run' : 'will restart the app'}; `
