@@ -1,4 +1,4 @@
-// dsh-restart-button — Host half.
+// dsh-fk-restart-button — Host half.
 //
 // One job: turn "this process tree is about to die" into "the desktop app comes
 // back on its own". None of that is obvious on Windows, so every step is written
@@ -40,7 +40,7 @@
 // there, including when its own path contains CJK.
 //
 // Node also removes the encoding problem. The app's path is
-// `D:\AI类型\deepseekharness\DeepSeek Harness.exe`, and a batch or PowerShell
+// `D:\<path with CJK>\DeepSeek Harness.exe`, and a batch or PowerShell
 // file carrying those bytes is a liability: Windows PowerShell 5.1 decodes a
 // BOM-less file as the system ANSI codepage, so CJK content can be mangled or can
 // terminate a string literal outright. So the helper holds no path at all: every
@@ -51,24 +51,86 @@
 // (8.3 short names would have been another way to dodge the CJK paths. They are
 // unavailable on this volume: `%~sI` returns the long path unchanged.)
 
+/**
+ * dsh-fk-restart-button · 宿主入口
+ *
+ * @version 1.1.0
+ *
+ * 1.1.0（2026-10-27）：把「清理累积认证 Cookie」的指令写进重启助手配置，
+ *   由助手在「DSH 已退出、端口已释放」的空窗期执行。
+ */
 import { spawn } from 'node:child_process'
-import { mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 
 /** Package name; also the client bundle id. */
-export const name = 'dsh-restart-button'
+export const name = 'dsh-fk-restart-button'
 
 /** Services this half consumes. `webServer` is all it needs. */
 export const inject = ['webServer']
 
 /** Route prefix. Exact routes only — see the note in `apply`. */
-const ROUTE = '/plugins/dsh-restart-button'
+const ROUTE = '/plugins/dsh-fk-restart-button'
 
-/** The port the desktop app always serves on (dsh-desktop-host hard-codes it). */
-const DESKTOP_PORT = 19387
+/**
+ * Legacy route prefix, kept as an alias after the FK rename.
+ *
+ * The browser half is rebuilt from the same source, so it always requests the new
+ * path. This alias exists for anything OUTSIDE this package that remembered the
+ * old URL — a bookmark, a script, `verify/*.mjs` from an older checkout — so a
+ * rename cannot silently turn a working button into a 404.
+ */
+const LEGACY_ROUTE = '/plugins/dsh-restart-button'
+
+/**
+ * Fallback port, used only when the real one cannot be discovered.
+ *
+ * This MUST NOT be treated as the answer. An earlier version asserted that
+ * `dsh-desktop-host` hard-codes 19387 and hardcoded it here; measured on a later
+ * build, the host passes NO `--port` at all and the server binds a dynamically
+ * assigned one (59292 on the machine this was found on). With the constant used
+ * blindly, the helper waits for a port that is not the one in use, spins out its
+ * 40-second grace period, and only relaunches by luck.
+ *
+ * `discoverPort()` below is the real source; this is the last resort.
+ */
+const FALLBACK_PORT = 19387
+
+/**
+ * The port this Host is actually serving on.
+ *
+ * Discovered from the server this plugin is already mounted on, via the requests
+ * it answers: `Host` is the authority the browser used to reach us, so it names
+ * the port in use rather than the port the code expected. Read once, on the first
+ * request, because `apply` runs before the server has necessarily bound.
+ *
+ * @param req - an incoming request, whose Host header carries the authority.
+ * @returns the port in use, or the fallback when nothing better is available.
+ */
+let observedPort = null
+function discoverPort(req) {
+  if (observedPort !== null) return observedPort
+  try {
+    const host = req?.headers?.host
+    if (typeof host === 'string' && host !== '') {
+      // `host:port`, or a bare host when on the default port.
+      const match = /:(\d+)$/.exec(host)
+      if (match !== null) {
+        const port = Number.parseInt(match[1], 10)
+        if (Number.isInteger(port) && port > 0 && port < 65536) {
+          observedPort = port
+          return observedPort
+        }
+      }
+    }
+  } catch {
+    /* fall through to the fallback */
+  }
+  return observedPort ?? FALLBACK_PORT
+}
 
 /** The relaunch helper, shipped beside the browser bundle. */
 const HELPER_SCRIPT = fileURLToPath(new URL('./lib/relaunch-helper.cjs', import.meta.url))
@@ -204,6 +266,68 @@ function helperDir() {
   return join(tmpdir(), 'dsh-restart-helper')
 }
 
+// ─────────────────────────────────────────────────────────────
+// FK addition: accumulated auth-cookie cleanup
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Locate Electron's userData root.
+ *
+ * Kept local on purpose: this plugin must stay installable on its own. Importing
+ * dsh-fk-rollback's estate module would make a missing/renamed companion plugin
+ * break the restart button, which is the one thing that must always work.
+ *
+ * @returns {string|null} e.g. C:\Users\you\AppData\Roaming\@deepseek-ai\dsh-desktop
+ */
+function locateUserData() {
+  const roaming = process.env.APPDATA
+    || (process.env.USERPROFILE ? join(process.env.USERPROFILE, 'AppData', 'Roaming') : null)
+  if (!roaming) return null
+  const candidates = [
+    join(roaming, '@deepseek-ai', 'dsh-desktop'),
+    join(roaming, 'DeepSeek Harness'),
+    join(roaming, 'dsh-desktop'),
+  ]
+  for (const c of candidates) {
+    if (existsSync(c)) return c
+  }
+  return null
+}
+
+/**
+ * Build the cookie-cleanup instructions for the relaunch helper.
+ *
+ * The helper runs after the app is dead and the port is released - Chromium's
+ * lock on the cookie database is only gone in that window. See the long note in
+ * lib/relaunch-helper.cjs for why this is safe and why it matters.
+ *
+ * Returns null on any probe failure: cleanup is a bonus, restarting is not.
+ *
+ * @returns {{dbPath:string, backupDir:string, markerPath:string}|null}
+ */
+function buildCookiesCleanup() {
+  try {
+    const userData = locateUserData()
+    if (userData === null) return null
+    const dbPath = join(userData, 'Network', 'Cookies')
+    if (!existsSync(dbPath)) return null
+
+    const stamp = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 15)
+    const dir = helperDir()
+    return {
+      dbPath,
+      backupDir: join(dir, 'cookie-backups', stamp),
+      markerPath: join(dir, 'cookie-cleanup.json'),
+      // FK addition: identify which restart entry produced this snapshot.
+      // Both plugins share restart-helper/, so without this the data cannot
+      // be traced back to the sidebar button vs the rollback panel button.
+      triggeredBy: 'dsh-fk-restart-button (侧边栏按钮)',
+    }
+  } catch {
+    return null
+  }
+}
+
 /**
  * Describe the application this Host is running inside.
  *
@@ -257,9 +381,13 @@ function resolveTarget() {
  * @param target - resolved target description.
  * @param dryRun - when true the helper is told to verify everything and stop
  *   short of killing anything. See the note on the config's `dryRun` field.
+ * @param graceMs - how long the helper waits before it kills anything. The
+ *   default (1200 ms) only covers the HTTP response that started it, which is
+ *   right for a click but too short for a caller that still has something to
+ *   finish saying — see the route's own note on this parameter.
  * @returns the created helper's PID, or an explanation of the failure.
  */
-async function startHelper(target, dryRun = false) {
+async function startHelper(target, dryRun = false, graceMs = undefined, port = null) {
   const node = resolveNode()
   if (node === null) {
     return { helperPid: null, error: '找不到 DSH 自带的 node.exe，无法启动重启助手' }
@@ -285,13 +413,23 @@ async function startHelper(target, dryRun = false) {
   writeFileSync(configPath, JSON.stringify({
     appPid: target.appPid,
     exePath: target.exePath,
-    port: DESKTOP_PORT,
+    // The port this Host is actually serving on, so the helper waits for the
+    // right one to be released. See FALLBACK_PORT for what happens when it is
+    // wrong: a 40-second grace period that never clears, then a relaunch by luck.
+    port: Number.isInteger(port) && port > 0 ? port : FALLBACK_PORT,
     workingDir: target.workingDir ?? null,
     env,
     // A dry run exists so the whole creation path can be exercised - and tested -
     // without disturbing a running DSH. The helper still verifies the target, the
     // tools and the port, then stops before the kill; see its own note.
     dryRun,
+    // Omitted entirely when the caller did not ask for a longer one, so the
+    // helper's own default stays the single place that number is written down.
+    ...(graceMs === undefined ? {} : { graceMs }),
+    // FK addition: the helper clears accumulated dsh-auth-* cookies in the
+    // window between the kill and the relaunch. Omitted for a dry run, which
+    // exits before that point anyway.
+    ...(dryRun ? {} : { cookies: buildCookiesCleanup() }),
     requestedAt: new Date().toISOString(),
   }, null, 2), 'utf8')
 
@@ -494,8 +632,12 @@ export function apply(ctx) {
     }
   }
 
-  /** What the browser half needs before it is allowed to restart. */
-  const describe = () => {
+  /**
+   * What the browser half needs before it is allowed to restart.
+   * @param req - the incoming request, used to discover the serving port.
+   * @returns the description sent as JSON.
+   */
+  const describe = (req) => {
     const target = resolveTarget()
     const node = resolveNode()
     return {
@@ -512,7 +654,8 @@ export function apply(ctx) {
         : target.reason,
       appPid: target.ok ? target.appPid : null,
       appName: target.ok ? target.appName : null,
-      port: DESKTOP_PORT,
+      // The port actually in use, discovered from this request rather than assumed.
+      port: discoverPort(req),
       platform: process.platform,
       // Reported because it is carried into the relaunch: the profile's sandbox
       // policy derives its `workspaceRoot` from `process.cwd()`, so the value the
@@ -532,28 +675,51 @@ export function apply(ctx) {
     kind: 'exact',
     path: `${ROUTE}/info`,
     handler: (req, res) => {
-      sendJson(res, 200, describe())
+      // `req` is passed so the description can report the port actually in use.
+      sendJson(res, 200, describe(req))
     },
   }), 'restart-button: info route')
 
-  ctx.effect(() => server.register({
-    kind: 'exact',
-    path: `${ROUTE}/restart`,
-    handler: (req, res) => {
-      if (req.method !== 'POST') {
-        sendJson(res, 405, { ok: false, error: '这个地址只接受 POST。' })
-        return
-      }
-      const target = resolveTarget()
-      if (!target.ok) {
-        sendJson(res, 409, { ok: false, error: target.reason })
-        return
-      }
+  /**
+   * The `/restart` handler, shared by the current and legacy paths.
+   *
+   * Extracted rather than duplicated: a rename must not fork the restart logic,
+   * or the two copies drift and only one gets a bug fix.
+   */
+  const restartHandler = (req, res) => {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { ok: false, error: '这个地址只接受 POST。' })
+      return
+    }
+    const target = resolveTarget()
+    if (!target.ok) {
+      sendJson(res, 409, { ok: false, error: target.reason })
+      return
+    }
       // `?dryRun=1` creates the helper and lets it check everything it would
       // need, but stops it before the kill. It exists so this whole path can be
       // exercised - by a person or by verify/verify-route.mjs - without
       // restarting a DSH that may be in the middle of something.
       const dryRun = new URL(req.url, 'http://127.0.0.1').searchParams.get('dryRun') === '1'
+
+      // How long the helper waits before it kills anything, in milliseconds.
+      //
+      // `?graceMs=` exists because 1.2 s is the right number for a button press and
+      // the WRONG one for a caller that is still talking: an agent that starts a
+      // restart and then keeps writing gets cut off mid-sentence, because the
+      // process carrying its reply is the one being killed. Measured here: the
+      // helper fires at 1.2 s, the turn's last message is never delivered, and the
+      // session looks like it crashed rather than restarted.
+      //
+      // Bounded rather than open: 0 is allowed (the caller may genuinely want the
+      // kill immediately), and anything above two minutes is clamped, because a
+      // restart that looks like it did nothing is its own failure. A non-numeric
+      // value falls back to the helper's default instead of being rejected — this
+      // is a convenience parameter, not a contract.
+      const rawGrace = new URL(req.url, 'http://127.0.0.1').searchParams.get('graceMs')
+      const graceMs = rawGrace === null || !/^\d+$/.test(rawGrace.trim())
+        ? undefined
+        : Math.min(120000, Math.max(0, Number(rawGrace.trim())))
 
       // The guard is deliberately NOT taken for a dry run, and that is a fix
       // rather than a convenience. `restarting` is cleared only when a restart
@@ -573,7 +739,9 @@ export function apply(ctx) {
       }
 
       void (async () => {
-        const started = await startHelper(target, dryRun)
+        // The port in use, discovered from this request, so the helper waits for
+        // the right one to be released instead of one that was never bound.
+        const started = await startHelper(target, dryRun, graceMs, discoverPort(req))
         if (started.helperPid === null) {
           // Nothing was killed, so the session is intact and the failure can be
           // reported honestly rather than pretended away.
@@ -596,14 +764,19 @@ export function apply(ctx) {
           + `${dryRun ? 'is doing a dry run' : 'will restart the app'}; `
           + `log at ${started.logPath}`,
         )
-        // Answered BEFORE the helper's 1.2 s grace expires, so the browser learns
-        // the restart is under way and can start polling for the new process.
+        // Answered BEFORE the helper's grace expires, so the browser learns the
+        // restart is under way and can start polling for the new process. With a
+        // long `graceMs` that window is wide, which is the point: a caller that
+        // asked for 15 s has 15 s of this process still alive to receive it.
         sendJson(res, 200, {
           ok: true,
           dryRun,
           helperPid: started.helperPid,
           logPath: started.logPath,
           token: BOOT_TOKEN,
+          // Echoed so the caller knows what it actually got: clamped, defaulted
+          // or exactly what it asked for. `null` means the helper's own default.
+          graceMs: graceMs ?? null,
         })
       })().catch((error) => {
         restarting = false
@@ -614,6 +787,31 @@ export function apply(ctx) {
           res.end()
         }
       })
-    },
+  }
+
+  ctx.effect(() => server.register({
+    kind: 'exact',
+    path: `${ROUTE}/restart`,
+    handler: restartHandler,
   }), 'restart-button: restart route')
+
+  // Legacy alias: answer the pre-rename paths with the same handlers.
+  //
+  // Registered as separate exact routes for the same reason the two above are:
+  // a prefix would swallow this package's own client bundle request. These are
+  // additive — they do not replace the new paths, so nothing that learned the
+  // old URL breaks when the package is renamed.
+  ctx.effect(() => server.register({
+    kind: 'exact',
+    path: `${LEGACY_ROUTE}/info`,
+    handler: (req, res) => {
+      sendJson(res, 200, describe(req))
+    },
+  }), 'restart-button: legacy info route')
+
+  ctx.effect(() => server.register({
+    kind: 'exact',
+    path: `${LEGACY_ROUTE}/restart`,
+    handler: restartHandler,
+  }), 'restart-button: legacy restart route')
 }

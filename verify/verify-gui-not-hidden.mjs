@@ -25,10 +25,19 @@
 import { closeSync, openSync, readFileSync, readSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findHostPort } from './find-port.mjs'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const helperPath = join(packageRoot, 'lib', 'relaunch-helper.cjs')
-const PORT = Number(process.env.DSH_PORT ?? 19387)
+
+// The Host binds a dynamically assigned port, so it is discovered rather than
+// assumed. See find-port.mjs.
+const PORT = await findHostPort()
+if (PORT === null) {
+  console.error('Could not find the running DSH Host. Start the desktop app first.')
+  process.exit(2)
+}
+const ROUTE = `http://127.0.0.1:${String(PORT)}/plugins/dsh-fk-restart-button`
 
 let failures = 0
 const check = (label, ok, detail) => {
@@ -107,7 +116,7 @@ check(
 
 let info = null
 try {
-  const response = await fetch(`http://127.0.0.1:${String(PORT)}/plugins/dsh-restart-button/info`)
+  const response = await fetch(`http://127.0.0.1:${String(PORT)}/plugins/dsh-fk-restart-button/info`)
   info = await response.json()
 } catch {
   info = null
@@ -149,7 +158,7 @@ if (imageName !== null) {
   // before the header is read.
   const candidates = [
     join(dirname(process.execPath), '..', '..', '..', '..', '..', imageName),
-    `D:\\AI类型\\deepseekharness\\${imageName}`,
+    // 本机安装路径已脱敏；上面两行由 process.execPath 推导已足够
   ]
   let appExe = null
   for (const candidate of candidates) {

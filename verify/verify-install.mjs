@@ -6,14 +6,14 @@
 // decides whether the button can appear is a short chain of resolutions, and
 // every link in it can be checked offline:
 //
-//   1. `dsh-restart-button/package.json` must RESOLVE from the profile, which
+//   1. `dsh-fk-restart-button/package.json` must RESOLVE from the profile, which
 //      needs the package's own "./package.json" export to exist.
 //   2. the manifest must declare `dsh.client.platform === "web"`, and
 //      `exports["./client"]` must name a file that is really there.
 //   3. that file must be the loader wrapper the shell expects, and evaluating it
 //      must yield an `apply` function.
 //
-//   node verify/verify-install.mjs [--profile-dir D:\dsh-data\profiles\desktop]
+//   node verify/verify-install.mjs [--profile-dir <DSH_HOME>\profiles\desktop]
 
 import { createRequire } from 'node:module'
 import { existsSync, readFileSync } from 'node:fs'

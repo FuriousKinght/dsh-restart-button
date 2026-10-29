@@ -5,7 +5,7 @@
 // through the factory's `require`, which the shell's module table supplies, so
 // the wrapper is the whole build.
 //
-//   window.__ModuleLoader__.load({ id: "dsh-restart-button", factory: (require) => {
+//   window.__ModuleLoader__.load({ id: "dsh-fk-restart-button", factory: (require) => {
 //   var module = { exports: {} }; var exports = module.exports;
 //   <src/client.js verbatim>
 //   return module.exports; } });

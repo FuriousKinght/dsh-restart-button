@@ -1,4 +1,4 @@
-# dsh-restart-button
+# dsh-fk-restart-button
 
 A button at the foot of the sidebar that restarts the DSH desktop app: it closes
 itself, comes back, and the page reconnects on its own. No more closing the window
@@ -19,6 +19,156 @@ by hand and double-clicking the icon again.
   first arms it for 5 seconds, the second confirms.
 - **Nothing to configure:** the plugin declares no settings namespace and has no
   dependencies outside the Node standard library.
+
+### FK changes (v1.1.0, 2026-10-27)
+
+This fork adds two changes on top of upstream `dsh-restart-button`:
+
+**1. Graceful shutdown before the relaunch**
+
+The upstream helper force-kills with `taskkill /T /F`. A forced kill does not
+give Chromium time to flush its LevelDB buffers (`Cookies`, `shared_proto_db`),
+and the 2026-10-22 incident showed why that matters: the state database was
+written broken and the app refused to start with `Web authentication failed`,
+with no config snapshot able to repair it.
+
+The fork uses the same sequence DSH itself uses in `stop()`:
+
+```text
+taskkill /T          -> wait 8s   (Chromium flushes and closes its DBs)
+taskkill /T /F       -> wait 5s   (only if still alive)
+still alive          -> fall through to the 40s port-clear wait, then WARN
+```
+
+Cost: the restart takes about 8 seconds longer. Benefit: state databases are
+essentially never written broken.
+
+**2. Accumulated auth-cookie cleanup in the restart window**
+
+DSH binds a dynamic port on every launch and mints one auth cookie whose name
+is derived from it:
+
+```text
+"dsh-auth-" + base64url(sha256("127.0.0.1:PORT"))
+```
+
+A new port means a new name, old cookies are never removed, and Chromium sends
+every one of them for host `127.0.0.1`. At **71** cookies the Cookie request
+header reaches 16,584 bytes, past Node's default `maxHeaderSize` of 16,384; the
+Host then fails with `HPE_HEADER_OVERFLOW` and the shell reports
+`desktop welcome: Web authentication failed`. Measured on Node 24.21.0:
+70 cookies = 16,356 B (200 OK), 71 = 16,584 B (crash).
+
+These cookies hold no account data — only `authority`, `issuedAt`, `expiresAt` —
+and a cookie minted for an old port can never match a new one, so removing them
+costs nothing. The login token lives in `.credentials.yaml`.
+
+The helper clears them in the window between the kill and the relaunch — the
+only moment Chromium's exclusive lock on the database is gone:
+
+```text
+① back up  -> <DSH_HOME>/restart-helper/cookie-backups/<stamp>/Cookies
+② DELETE FROM cookies WHERE host_key IN ('127.0.0.1','localhost')
+                          AND name LIKE 'dsh-auth-%'
+③ drop a zero-byte Cookies-journal
+④ write cookie-cleanup.json so the next Host boot can seed an estimate
+```
+
+A cleanup failure is logged and never blocks the restart.
+
+The button's confirmation text now says so:
+
+```text
+会中断正在运行的任务，再点一次就重启（顺带清理累积的认证 Cookie）。
+```
+
+**Where the numbers live**
+
+| File | Version |
+|---|---|
+| `package.json` | 1.1.0 |
+| `entry.js` | `@version 1.1.0` |
+| `lib/client.js` | `@version 1.1.0` |
+| `lib/relaunch-helper.cjs` | `@version 1.1.0` |
+
+---
+
+**3. A measured snapshot, not just a cleanup**
+
+The helper clears accumulated cookies — but the same moment is also the only
+chance to *measure* them, because Chromium holds an exclusive lock on the
+database while the app is alive. Verified on this machine (all seven failed):
+
+| Approach | Result |
+|---|---|
+| `fs.readFileSync` | `EBUSY` |
+| `fs.openSync('r') + readSync` | `EBUSY` |
+| `fs.createReadStream` | `EBUSY` |
+| `new DatabaseSync(path, {readOnly:true})` | `unable to open database file` |
+| `mode=ro&immutable=1` | same |
+| CDP `Network.getCookies` | `unsupported Network method` |
+| CDP `Storage.getCookies` | `Method not found` |
+
+So the helper writes a full snapshot, not just a count:
+
+```json
+{
+  "at": "2026-10-27T09:50:00.000Z",
+  "observed": 4,
+  "total": 4,
+  "removed": 4,
+  "headerBytes": 912,
+  "headerBudget": 15984,
+  "ratio": 0.057,
+  "ports": [53975, 64245, 56306, 63890],
+  "oldest": 1792629835700,
+  "newest": 1793055716000,
+  "backupPath": "...",
+  "source": "relaunch-helper",
+  "triggeredBy": "dsh-fk-restart-button (侧边栏按钮)"
+}
+```
+
+**Written unconditionally (v1.1.0 fix).** The first implementation only wrote it
+when `removed > 0`, which meant a clean restart produced no record at all — and
+then the panel could never show a real measurement to compare its estimate
+against:
+
+```js
+// wrong
+if (removed > 0 && typeof cfg.markerPath === 'string') { ... }
+
+// right
+const snapshot = { ... }
+if (typeof cfg.markerPath === 'string' && cfg.markerPath !== '') {
+  fs.writeFileSync(cfg.markerPath, JSON.stringify(snapshot, null, 2), 'utf8')
+}
+```
+
+**`triggeredBy` identifies which entry point ran the restart.** Both this plugin
+and `dsh-fk-rollback` share the same `<DSH_HOME>/restart-helper/` directory
+(both compute `helperDir()` the same way), so without this field the snapshot
+cannot be traced back to the sidebar button versus the rollback panel button.
+
+**Where the data goes**
+
+```text
+<DSH_HOME>/restart-helper/cookie-cleanup.json      ← this plugin writes it
+        │
+        │  consumed by dsh-fk-rollback/entry.js only
+        ▼
+<DSH_HOME>/rollback-snapshots/<profile>/cookie-observed.json
+        │
+        ▼
+设置 → FK回滚设置 → hover【认证 Cookie】
+```
+
+**This plugin writes; `dsh-fk-rollback` displays.** Installing both is
+recommended: the sidebar button for daily use, the rollback plugin for state
+management and data display. Installed alone, this plugin still produces the
+snapshot, but nothing consumes it.
+
+---
 
 ### Version requirement
 
@@ -49,7 +199,7 @@ deliberately.
 
 | Path | What it is |
 | --- | --- |
-| [`entry.js`](entry.js) | Host half: serves `/plugins/dsh-restart-button/{info,restart}` and starts the relaunch helper. |
+| [`entry.js`](entry.js) | Host half: serves `/plugins/dsh-fk-restart-button/{info,restart}` and starts the relaunch helper. |
 | [`src/client.js`](src/client.js) | Browser half: registers one action in the `sidebar.footer.action` slot. |
 | [`lib/client.js`](lib/client.js) | The built browser bundle. Committed, so the repository installs from source with no build step. |
 | [`lib/relaunch-helper.cjs`](lib/relaunch-helper.cjs) | The process that outlives the kill and starts the app again. |
@@ -67,7 +217,7 @@ from outside and start the executable again, which brings two problems this plug
 exists to solve:
 
 1. **The helper must outlive the tree it kills.** Killing only the main process
-   would orphan the Host and leave port 19387 bound, so the new app could not
+   would orphan the Host and leave the server's port bound, so the new app could not
    serve. `taskkill /T` takes the tree — including any process this plugin spawned
    normally, since `/T` walks the parent/child chain and a `detached` child is still
    a child in it. The helper is therefore created through WMI
@@ -139,15 +289,37 @@ DSH 桌面版本体是 Electron：`DeepSeek Harness.exe`（主进程）负责窗
 
 ### 坑一：助手进程必须活过它自己要杀的那棵树
 
-杀掉主进程是不够的——Host 子进程会变成孤儿，继续占着 19387 端口，新起来的应用绑不上端口。所以必须 `taskkill /T`（连整棵树一起杀）。但 `/T` 是按父子链走的，**普通 `spawn(..., {detached:true})` 出来的子进程仍然在这条链上**，会跟着一起死。
+杀掉主进程是不够的——Host 子进程会变成孤儿，继续占着服务端口，新起来的应用绑不上端口。所以必须 `taskkill /T`（连整棵树一起杀）。但 `/T` 是按父子链走的，**普通 `spawn(..., {detached:true})` 出来的子进程仍然在这条链上**，会跟着一起死。
 
 解法：用 WMI（`Win32_Process.Create`）创建助手进程。WMI 创建出来的进程父进程是 `WmiPrvSE.exe`，**不在被杀的树里**。这一点在本机实测过，也有自动化测试守着（见下）。
+
+### 坑一之补充：**端口是动态分配的，不能写死**
+
+助手杀掉进程后要**等端口释放**再拉起新实例，所以它必须知道端口。初版把这个端口写死成 `19387`，注释还写着"`dsh-desktop-host` 硬编码了它"。
+
+**这个假设已经过时了。** 实测当前 Host 的命令行里**根本没有 `--port`**，服务绑的是操作系统动态分配的端口 —— 这台机器上先后见过 `59292`、`59410`。
+
+后果很隐蔽：助手会去等一个**从未被绑定**的端口，40 秒宽限期永远不清除，最后**靠运气**完成重启。日志里能直接看到这个差别：
+
+```
+09:05  start: ... port=19387   [DRY RUN]      ← 旧代码：写死，错
+10:11  start: ... port=59292                  ← 新代码：真实端口
+10:11  process and port are clear; launching  ← 等待命中，没有空转
+```
+
+现在的做法是从**正在服务的请求里**读出端口：`Host` 头就是浏览器用来找到我们的那个 authority，它必然带着真实端口。
+
+```js
+const port = discoverPort(req)   // 从 req.headers.host 解析
+```
+
+只在拿不到时回退到 `FALLBACK_PORT`。测试套件同样不再假设端口，而是通过 `verify/find-port.mjs` 去发现 —— 否则它们会报告"插件不可达"，而实际情况只是**测试找错了地方**。
 
 ### 坑二：WMI 创建出来的 `powershell.exe` 根本起不来
 
 一开始助手是用 PowerShell 写的。实测结果是：WMI 返回成功、进程号也有了，但进程瞬间退出，"拒绝访问"，不写日志、不留输出——哪怕脚本只有三行、只是往文件里追加一行字。同样的环境里 `cmd.exe`、`whoami`、`where` 都正常。
 
-换成本机自带的 `node.exe` 就正常了，**即使它的路径里有中文**。所以助手是一个 Node 脚本（[`lib/relaunch-helper.cjs`](lib/relaunch-helper.cjs)），顺带也把编码问题一起解决了——应用路径是 `D:\AI类型\deepseekharness\DeepSeek Harness.exe`，而 `.ps1` / `.cmd` 里塞中文是危险的：Windows PowerShell 5.1 会把无 BOM 的文件按系统 ANSI 代码页解码，中文可能被改坏、甚至提前结束字符串字面量。
+换成本机自带的 `node.exe` 就正常了，**即使它的路径里有中文**。所以助手是一个 Node 脚本（[`lib/relaunch-helper.cjs`](lib/relaunch-helper.cjs)），顺带也把编码问题一起解决了——应用路径是 `D:\<含中文的安装路径>\DeepSeek Harness.exe`，而 `.ps1` / `.cmd` 里塞中文是危险的：Windows PowerShell 5.1 会把无 BOM 的文件按系统 ANSI 代码页解码，中文可能被改坏、甚至提前结束字符串字面量。
 
 （本来还有一条路是 8.3 短路径，可以绕开中文路径。本机这个卷**没开** 8.3：`%~sI` 原样返回长路径。）
 
@@ -273,17 +445,45 @@ log(`launch: subsystem=... windowsHide=...`)   // 决策写进日志
 node tools/install.mjs --profile desktop
 ```
 
-做两件事：在 `<profile>/node_modules/` 下建一个目录联接，以及在 `<profile>/cordis.patch.yml` 末尾追加一行 `- insert:`。
+它做的是 **`dsh plugin add link:<绝对路径>`** —— 也就是 DSH 官方的插件安装方式。那一件事同时完成两处登记：写进 profile 的 `dependencies`，以及把它加入 `dsh.profile.bundles`。
 
-补丁层是热加载的，所以**装完不用重启**就会挂上；但浏览器页面要刷新一次才会出现按钮。
+**它不碰 profile 的 `cordis.patch.yml`。** 本包自己的 `cordis.patch.yml` 就是 bundle 层，DSH 会按 bundle 顺序自动加载它；再手工抄一份进 profile 会**把同一行挂载两次**，而且绕过了 bundle 的加载时序。
 
-卸载：
+### 为什么不是"建联接 + 加一行 patch"
+
+初版就是这么做的：在 `<profile>/node_modules/` 下建目录联接，再往 profile 的补丁层追加一行 `- insert:`。
+
+**插件当时完全能用** —— 路由应答、按钮出现、测试全过 —— **但在「插件」页里看不到它**，而这正是你发现的问题。
+
+原因写在插件管理器自己的文档里：
+
+> **只有组合包会被管理** —— 没有 bundle 补丁的依赖在安装前就被拒绝；profile **已持有但未被选中**的依赖不会出现在页面上。
+
+`listBundles` 的 schema 说得更明确：它列的是 "installed, installation-provided, and offline Official catalog bundles, plus **selected** non-bundle names"。
+
+**关键在于"选中"** —— 由 `dsh.profile.bundles` 决定，而**只有 `dsh plugin add` 会写它**。手工建联接加一行 patch，得到的插件能跑，但**不在依赖记录里、也没被任何东西选中**，于是管理器不认它。
+
+同门的三个插件（`dsh-fk-oc-free`、`dsh-fk-rollback`、`dsh-fk-search-tier`）都是走 `dsh plugin add` 装的，所以它们正常显示 —— 它们各自的 patch 层注释里还专门警告过 **"不要手工把内容抄进 profile 的 cordis.patch.yml"**（`dsh-fk-search-tier` 写了原因：会导致 provider 互相等待）。
+
+### 判断安装是否成功
+
+看两个条件，**两个都要满足**，脚本会分别断言而不是只看命令的退出码：
+
+```sh
+node -e "const p=require('./profiles/desktop/package.json'); \
+  console.log('dependency:', !!p.dependencies['dsh-fk-restart-button']); \
+  console.log('selected  :', p.dsh.profile.bundles.includes('dsh-fk-restart-button'))"
+```
+
+漏掉任何一个，插件都会"能跑但不上架"。命令成功和插件会被列出，不是同一件事。
+
+卸载（同样走官方方式，清掉两处登记）：
 
 ```sh
 node tools/uninstall.mjs --profile desktop
 ```
 
-两个脚本都用 Node 而不是 PowerShell 写，是刻意的：补丁层是无 BOM 的 UTF-8 而且里面有中文（某个 provider 的 `displayName`），而 PowerShell 5.1 的两个默认行为恰好都会毁掉它（`Get-Content` 按 ANSI 解码、`Set-Content -Encoding utf8` 写出带 BOM）。用 Node 就是按它本来的样子读、按它本来的样子写。
+两个脚本都用 Node 而不是 PowerShell 写，是刻意的：它们要读 profile 的 `package.json` 与补丁层，而这些是无 BOM 的 UTF-8 且含中文，PowerShell 5.1 的两个默认行为恰好都会毁掉它（`Get-Content` 按 ANSI 解码、`Set-Content -Encoding utf8` 写出带 BOM）。用 Node 就是按它本来的样子读、按它本来的样子写。
 
 ## 验证
 
@@ -296,6 +496,10 @@ node verify/verify-gui-not-hidden.mjs    # GUI 程序不得被隐藏启动（防
 node verify/verify-no-console-window.mjs # 创建助手不得弹出终端窗口 —— 需要 DSH 在跑
 node verify/verify-route.mjs             # 直接打 /restart 路由（dry-run，不会真的重启）——需要 DSH 在跑
 ```
+
+四套需要连运行中 DSH 的验证，都通过 [`verify/find-port.mjs`](verify/find-port.mjs) **自己发现端口**，不假设 `19387`。这个文件按 `DSH_PORT` → `DSH_WEB_URL` → 扫描 DSH 进程监听端口的顺序找，并用"插件是否应答"作为最终判据。
+
+它存在的理由很实际：端口写死的时候，这些套件会在端口变化后报告"**无法连接**"，读起来像是插件坏了，而实际只是**测试去错了地方**。测试找错地方和产品坏掉，看起来可以一模一样 —— 这个项目里已经因此误判过一次（见坑三）。
 
 `verify-gui-not-hidden.mjs` 守的是**我自己引入的回归**：修好弹窗后我顺手把应用的 `windowsHide` 也改成 `true`，导致重启后的程序在后台运行。它断言三件事 —— 助手从 PE 头**派生**这个标志、**真实的 exe 确实是 GUI**、**`node.exe` 确实是控制台程序**。最后一条是**对照组**：没有它，"只隐藏控制台程序"这条规则可以靠"全都隐藏"来满足，而"全都隐藏"正是那个 bug。
 

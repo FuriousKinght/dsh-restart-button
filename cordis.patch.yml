@@ -1,12 +1,12 @@
-# dsh-restart-button bundle layer: mounted by `dsh plugin add`, so a profile gets
+# dsh-fk-restart-button bundle layer: mounted by `dsh plugin add`, so a profile gets
 # this row without hand-editing cordis.patch.yml. A profile-level patch can still
 # disable the row by id.
 #
-# The Host half serves /plugins/dsh-restart-button/{info,restart}; the browser
+# The Host half serves /plugins/dsh-fk-restart-button/{info,restart}; the browser
 # half adds one action beside Settings at the sidebar foot. No settings namespace
 # is declared: this plugin has nothing to configure, and an entry whose Config
 # projects an empty form is simply not described by the settings service.
 
 - insert:
     - id: restart-button
-      name: dsh-restart-button
+      name: dsh-fk-restart-button

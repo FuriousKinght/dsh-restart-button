@@ -1,4 +1,4 @@
-// dsh-restart-button — browser half.
+// dsh-fk-restart-button — browser half.
 //
 // Registers one action beside Settings at the sidebar foot. The button owns the
 // whole rest of the feature, because the interesting part is not the click: it is
@@ -24,7 +24,11 @@
 // would silently never register.
 
 /** Dedicated route the Host half serves. */
-const ROUTE = '/plugins/dsh-restart-button'
+//
+// @version 1.1.0
+//
+// 1.1.0（2026-10-27）：重启按钮的确认提示里说明「顺带清理累积的认证 Cookie」。
+const ROUTE = '/plugins/dsh-fk-restart-button'
 
 /** Slot the action lands in: the row beside Settings at the sidebar foot. */
 const SLOT = 'sidebar.footer.action'
@@ -33,7 +37,7 @@ const SLOT = 'sidebar.footer.action'
 const ENTRY_ID = 'restart-button'
 
 /** Style tag id, so the stylesheet is installed exactly once. */
-const STYLE_ID = 'dsh-restart-button-style'
+const STYLE_ID = 'dsh-fk-restart-button-style'
 
 /** How long the "click again to confirm" state stays armed. */
 const CONFIRM_MS = 5000
@@ -255,7 +259,7 @@ function RestartButton(props) {
     : busy
       ? 'DSH 正在关闭并重新启动，页面会自动恢复。'
       : armed
-        ? '会中断正在运行的任务，再点一次就重启。'
+        ? '会中断正在运行的任务，再点一次就重启（顺带清理累积的认证 Cookie）。'
         : '关闭并重新启动 DSH（正在运行的任务会被中断）'
 
   const button = React.createElement('button', {

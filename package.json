@@ -1,6 +1,6 @@
 {
-  "name": "dsh-restart-button",
-  "version": "1.0.0",
+  "name": "dsh-fk-restart-button",
+  "version": "1.1.0",
   "description": "Adds a button at the foot of the sidebar that restarts the DSH desktop app and reloads the page when it comes back.",
   "license": "MIT",
   "type": "module",
@@ -38,7 +38,8 @@
     "entry.js",
     "build-client.mjs",
     "package.json",
-    "README.md"
+    "README.md",
+    "中文说明.md"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

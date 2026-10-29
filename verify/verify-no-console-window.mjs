@@ -19,12 +19,18 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findHostPort } from './find-port.mjs'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const PORT = Number(process.env.DSH_PORT ?? 19387)
-const ROUTE = `http://127.0.0.1:${String(PORT)}/plugins/dsh-restart-button`
+// The Host binds a dynamically assigned port, so it is discovered rather than assumed.
+const PORT = await findHostPort()
+if (PORT === null) {
+  console.error('Could not find the running DSH Host. Start the desktop app first.')
+  process.exit(2)
+}
+const ROUTE = `http://127.0.0.1:${String(PORT)}/plugins/dsh-fk-restart-button`
 const helperDir = process.env.DSH_HOME === undefined
-  ? 'D:\\dsh-data\\restart-helper'
+  ? join(process.env.TEMP ?? '.', 'dsh-restart-helper')
   : join(process.env.DSH_HOME, 'restart-helper')
 const LOG = join(helperDir, 'relaunch.log')
 
